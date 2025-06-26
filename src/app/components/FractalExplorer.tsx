@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
+import * as CANNON from 'cannon-es';
 
 interface FractalExplorerProps {}
 
@@ -61,6 +62,7 @@ export default function FractalExplorer({}: FractalExplorerProps) {
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
   const [isRotating, setIsRotating] = useState(false);
   const [resolution, setResolution] = useState(128);
+  const [physicsEnabled, setPhysicsEnabled] = useState(true);
   const [lightSettings, setLightSettings] = useState({
     intensity: 0.8,
     x: 10,
@@ -69,6 +71,11 @@ export default function FractalExplorer({}: FractalExplorerProps) {
     color: '#ffffff'
   });
   const lightRef = useRef<THREE.DirectionalLight | null>(null);
+  const worldRef = useRef<CANNON.World | null>(null);
+  const ballsRef = useRef<{ mesh: THREE.Mesh; body: CANNON.Body }[]>([]);
+  const terrainBodyRef = useRef<CANNON.Body | null>(null);
+  const ballMaterialRef = useRef<CANNON.Material | null>(null);
+  const terrainMaterialRef = useRef<CANNON.Material | null>(null);
 
   const initWebGPU = useCallback(async (): Promise<WebGPURenderer | null> => {
     if (!navigator.gpu) {
@@ -349,15 +356,65 @@ export default function FractalExplorer({}: FractalExplorerProps) {
     scene.add(directionalLight);
     lightRef.current = directionalLight;
 
+    // Initialize physics world
+    const world = new CANNON.World();
+    world.gravity.set(0, -9.82, 0);
+    world.broadphase = new CANNON.NaiveBroadphase();
+    world.solver.iterations = 10;
+    
+    // Enable collision detection between balls
+    world.defaultContactMaterial.friction = 0.3;
+    world.defaultContactMaterial.restitution = 0.6;
+    world.defaultContactMaterial.contactEquationStiffness = 1e8;
+    world.defaultContactMaterial.contactEquationRelaxation = 3;
+    
+    // Create contact materials for different object interactions
+    const ballMaterial = new CANNON.Material('ball');
+    const terrainMaterial = new CANNON.Material('terrain');
+    ballMaterialRef.current = ballMaterial;
+    terrainMaterialRef.current = terrainMaterial;
+    
+    // Ball-Ball interactions (bouncy)
+    const ballBallContact = new CANNON.ContactMaterial(ballMaterial, ballMaterial, {
+      friction: 0.2,
+      restitution: 0.8,
+      contactEquationStiffness: 1e8,
+      contactEquationRelaxation: 3
+    });
+    world.addContactMaterial(ballBallContact);
+    
+    // Ball-Terrain interactions (realistic)
+    const ballTerrainContact = new CANNON.ContactMaterial(ballMaterial, terrainMaterial, {
+      friction: 0.4,
+      restitution: 0.5,
+      contactEquationStiffness: 1e8,
+      contactEquationRelaxation: 3
+    });
+    world.addContactMaterial(ballTerrainContact);
+    
+    worldRef.current = world;
+
     // Controls
     const animate = () => {
       requestAnimationFrame(animate);
+      
+      // Step physics simulation
+      if (worldRef.current && physicsEnabled) {
+        worldRef.current.step(1/60);
+        
+        // Update ball positions from physics
+        ballsRef.current.forEach(({ mesh, body }) => {
+          mesh.position.copy(body.position as any);
+          mesh.quaternion.copy(body.quaternion as any);
+        });
+      }
+      
       if (rendererRef.current && sceneRef.current && cameraRef.current) {
         rendererRef.current.render(sceneRef.current, cameraRef.current);
       }
     };
     animate();
-  }, [dimensions]);
+  }, [dimensions, physicsEnabled]);
 
   const generateMandelbrotHeightMap = useCallback((meshResolution: number) => {
     const heightData = new Float32Array(meshResolution * meshResolution);
@@ -451,7 +508,138 @@ export default function FractalExplorer({}: FractalExplorerProps) {
     
     sceneRef.current.add(mesh);
     meshRef.current = mesh;
+
+    // Create physics collision mesh for terrain
+    if (worldRef.current) {
+      // Remove old terrain body if it exists
+      if (terrainBodyRef.current) {
+        worldRef.current.removeBody(terrainBodyRef.current);
+      }
+
+      // Create height field for physics collision that matches the fractal
+      const matrix = [];
+      for (let i = 0; i < meshRes; i++) {
+        matrix.push([]);
+        for (let j = 0; j < meshRes; j++) {
+          const index = i * meshRes + j;
+          // Scale height data to match visual representation
+          matrix[i].push(heightData[index] * 0.5); // Adjust scale for better physics
+        }
+      }
+
+      const heightfieldShape = new CANNON.Heightfield(matrix, {
+        elementSize: 8 / (meshRes - 1)
+      });
+      
+      const heightfieldBody = new CANNON.Body({ mass: 0 });
+      heightfieldBody.addShape(heightfieldShape);
+      heightfieldBody.position.set(-4, 0, -4);
+      heightfieldBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+      
+      // Use the shared terrain material
+      heightfieldBody.material = terrainMaterialRef.current;
+      
+      worldRef.current.addBody(heightfieldBody);
+      terrainBodyRef.current = heightfieldBody;
+
+      // Add invisible walls around the fractal to prevent balls from falling off
+      const wallHeight = 5;
+      const wallThickness = 0.5;
+      
+      // Bottom wall (safety net)
+      const bottomWallShape = new CANNON.Plane();
+      const bottomWallBody = new CANNON.Body({ mass: 0 });
+      bottomWallBody.addShape(bottomWallShape);
+      bottomWallBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), Math.PI / 2);
+      bottomWallBody.position.set(0, -3, 0);
+      bottomWallBody.material = terrainMaterialRef.current;
+      worldRef.current.addBody(bottomWallBody);
+      
+      // Side walls to contain the balls
+      const walls = [
+        { pos: [6, wallHeight/2, 0], rot: [0, 0, 1] },  // Right wall
+        { pos: [-6, wallHeight/2, 0], rot: [0, 0, 1] }, // Left wall  
+        { pos: [0, wallHeight/2, 6], rot: [1, 0, 0] },  // Back wall
+        { pos: [0, wallHeight/2, -6], rot: [1, 0, 0] }  // Front wall
+      ];
+      
+      walls.forEach(({ pos, rot }) => {
+        const wallShape = new CANNON.Box(new CANNON.Vec3(wallThickness, wallHeight/2, wallThickness));
+        const wallBody = new CANNON.Body({ mass: 0 });
+        wallBody.addShape(wallShape);
+        wallBody.position.set(pos[0], pos[1], pos[2]);
+        wallBody.quaternion.setFromAxisAngle(new CANNON.Vec3(rot[0], rot[1], rot[2]), Math.PI / 2);
+        wallBody.material = terrainMaterialRef.current;
+        worldRef.current.addBody(wallBody);
+      });
+    }
   }, [generateMandelbrotHeightMap]);
+
+  const createBouncingBalls = useCallback(() => {
+    if (!sceneRef.current || !worldRef.current) return;
+
+    // Clear existing balls
+    ballsRef.current.forEach(({ mesh, body }) => {
+      sceneRef.current?.remove(mesh);
+      worldRef.current?.removeBody(body);
+    });
+    ballsRef.current = [];
+
+    // Create 12 balls
+    for (let i = 0; i < 12; i++) {
+      // Random position above the scene
+      const x = (Math.random() - 0.5) * 6;
+      const y = 8 + Math.random() * 4;
+      const z = (Math.random() - 0.5) * 6;
+
+      // Create ball geometry and material
+      const radius = 0.1 + Math.random() * 0.1;
+      const geometry = new THREE.SphereGeometry(radius, 16, 16);
+      const material = new THREE.MeshLambertMaterial({
+        color: new THREE.Color().setHSL(Math.random(), 0.8, 0.6)
+      });
+      
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(x, y, z);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      sceneRef.current.add(mesh);
+
+      // Create physics body with collision properties
+      const shape = new CANNON.Sphere(radius);
+      const body = new CANNON.Body({ mass: 1 });
+      body.addShape(shape);
+      body.position.set(x, y, z);
+      
+      // Use the shared ball material for consistent physics
+      body.material = ballMaterialRef.current;
+      
+      // Add some initial random velocity for more interesting interactions
+      const initialVelocity = 2;
+      body.velocity.set(
+        (Math.random() - 0.5) * initialVelocity,
+        0,
+        (Math.random() - 0.5) * initialVelocity
+      );
+      
+      worldRef.current.addBody(body);
+
+      ballsRef.current.push({ mesh, body });
+    }
+  }, []);
+
+  const resetBalls = useCallback(() => {
+    ballsRef.current.forEach(({ body }) => {
+      // Reset position above scene
+      const x = (Math.random() - 0.5) * 6;
+      const y = 8 + Math.random() * 4;
+      const z = (Math.random() - 0.5) * 6;
+      
+      body.position.set(x, y, z);
+      body.velocity.set(0, 0, 0);
+      body.angularVelocity.set(0, 0, 0);
+    });
+  }, []);
 
   useEffect(() => {
     if (dimensions.width > 0 && dimensions.height > 0) {
@@ -477,6 +665,12 @@ export default function FractalExplorer({}: FractalExplorerProps) {
       create3DMesh();
     }
   }, [is3D, viewState, resolution, create3DMesh]);
+
+  useEffect(() => {
+    if (is3D && physicsEnabled && sceneRef.current && worldRef.current) {
+      createBouncingBalls();
+    }
+  }, [is3D, physicsEnabled, createBouncingBalls]);
 
   const renderFractalWebGPU = useCallback(() => {
     if (!webgpuRenderer || !canvasRef.current || dimensions.width === 0 || dimensions.height === 0) return;
@@ -1015,6 +1209,39 @@ export default function FractalExplorer({}: FractalExplorerProps) {
               >
                 Reset Light
               </button>
+            </div>
+
+            {/* Physics Controls */}
+            <div className="mb-3 border-t border-gray-600 pt-3">
+              <div className="text-xs font-bold mb-2">⚡ Physics</div>
+              
+              <div className="flex items-center gap-2 mb-2">
+                <input
+                  type="checkbox"
+                  id="physics-enabled"
+                  checked={physicsEnabled}
+                  onChange={(e) => setPhysicsEnabled(e.target.checked)}
+                  className="w-4 h-4"
+                />
+                <label htmlFor="physics-enabled" className="text-xs">Enable Physics</label>
+              </div>
+
+              {physicsEnabled && (
+                <div className="space-y-2">
+                  <button
+                    onClick={resetBalls}
+                    className="w-full bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded text-xs"
+                  >
+                    Reset Balls
+                  </button>
+                  <button
+                    onClick={createBouncingBalls}
+                    className="w-full bg-green-600 hover:bg-green-700 px-2 py-1 rounded text-xs"
+                  >
+                    Add More Balls
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Controls */}
