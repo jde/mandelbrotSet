@@ -19,6 +19,22 @@ interface WebGPURenderer {
   vertexBuffer: GPUBuffer;
 }
 
+interface Bookmark {
+  id: string;
+  name: string;
+  centerX: number;
+  centerY: number;
+  zoom: number;
+  timestamp: number;
+}
+
+interface SelectionRect {
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
+}
+
 export default function FractalExplorer({}: FractalExplorerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
@@ -31,6 +47,10 @@ export default function FractalExplorer({}: FractalExplorerProps) {
   const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
   const [webgpuRenderer, setWebgpuRenderer] = useState<WebGPURenderer | null>(null);
   const [supportsWebGPU, setSupportsWebGPU] = useState<boolean | null>(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(null);
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [isAnimating, setIsAnimating] = useState(false);
 
   const initWebGPU = useCallback(async (): Promise<WebGPURenderer | null> => {
     if (!navigator.gpu) {
@@ -251,6 +271,23 @@ export default function FractalExplorer({}: FractalExplorerProps) {
     return () => window.removeEventListener('resize', updateDimensions);
   }, []);
 
+  // Load bookmarks from localStorage on mount
+  useEffect(() => {
+    const savedBookmarks = localStorage.getItem('fractal-bookmarks');
+    if (savedBookmarks) {
+      try {
+        setBookmarks(JSON.parse(savedBookmarks));
+      } catch (error) {
+        console.error('Failed to load bookmarks:', error);
+      }
+    }
+  }, []);
+
+  // Save bookmarks to localStorage when they change
+  useEffect(() => {
+    localStorage.setItem('fractal-bookmarks', JSON.stringify(bookmarks));
+  }, [bookmarks]);
+
   useEffect(() => {
     if (dimensions.width > 0 && dimensions.height > 0 && supportsWebGPU === null) {
       initWebGPU().then(setWebgpuRenderer);
@@ -370,32 +407,145 @@ export default function FractalExplorer({}: FractalExplorerProps) {
     });
   }, [dimensions]);
 
+  const saveBookmark = useCallback((rect: SelectionRect) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // Calculate center and zoom from selection rectangle
+    const rectCenterX = (rect.startX + rect.endX) / 2;
+    const rectCenterY = (rect.startY + rect.endY) / 2;
+    const rectWidth = Math.abs(rect.endX - rect.startX);
+    const rectHeight = Math.abs(rect.endY - rect.startY);
+
+    // Convert screen coordinates to fractal coordinates
+    const currentZoom = Math.min(dimensions.width, dimensions.height) / 3.5 * viewState.zoom;
+    const fractalCenterX = (rectCenterX - dimensions.width / 2) / currentZoom + viewState.centerX;
+    const fractalCenterY = (rectCenterY - dimensions.height / 2) / currentZoom + viewState.centerY;
+
+    // Calculate zoom level to fit the selection
+    const zoomFactorX = dimensions.width / rectWidth;
+    const zoomFactorY = dimensions.height / rectHeight;
+    const newZoom = viewState.zoom * Math.min(zoomFactorX, zoomFactorY) * 0.8; // 0.8 for some padding
+
+    const bookmark: Bookmark = {
+      id: Date.now().toString(),
+      name: `Bookmark ${bookmarks.length + 1}`,
+      centerX: fractalCenterX,
+      centerY: fractalCenterY,
+      zoom: newZoom,
+      timestamp: Date.now(),
+    };
+
+    setBookmarks(prev => [...prev, bookmark]);
+  }, [canvasRef, dimensions, viewState, bookmarks.length]);
+
+  const animateToBookmark = useCallback((bookmark: Bookmark) => {
+    if (isAnimating) return;
+    
+    setIsAnimating(true);
+    const startState = { ...viewState };
+    const endState = {
+      zoom: bookmark.zoom,
+      centerX: bookmark.centerX,
+      centerY: bookmark.centerY
+    };
+    
+    const duration = 2000;
+    const startTime = Date.now();
+    
+    const animate = () => {
+      const elapsed = Date.now() - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      
+      const easeInOutQuad = (t: number) => 
+        t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+      
+      const easedProgress = easeInOutQuad(progress);
+      
+      const currentZoom = startState.zoom + (endState.zoom - startState.zoom) * easedProgress;
+      const currentCenterX = startState.centerX + (endState.centerX - startState.centerX) * easedProgress;
+      const currentCenterY = startState.centerY + (endState.centerY - startState.centerY) * easedProgress;
+      
+      setViewState({
+        zoom: currentZoom,
+        centerX: currentCenterX,
+        centerY: currentCenterY
+      });
+      
+      if (progress < 1) {
+        requestAnimationFrame(animate);
+      } else {
+        setIsAnimating(false);
+      }
+    };
+    
+    requestAnimationFrame(animate);
+  }, [viewState, isAnimating]);
+
+  const deleteBookmark = useCallback((id: string) => {
+    setBookmarks(prev => prev.filter(bookmark => bookmark.id !== id));
+  }, []);
+
   const handleMouseDown = useCallback((event: React.MouseEvent) => {
-    setIsDragging(true);
-    setLastMousePos({ x: event.clientX, y: event.clientY });
+    if (event.shiftKey) {
+      // Start rectangle selection when Shift is held
+      setIsSelecting(true);
+      setSelectionRect({
+        startX: event.clientX,
+        startY: event.clientY,
+        endX: event.clientX,
+        endY: event.clientY,
+      });
+    } else {
+      // Normal dragging
+      setIsDragging(true);
+      setLastMousePos({ x: event.clientX, y: event.clientY });
+    }
   }, []);
 
   const handleMouseMove = useCallback((event: React.MouseEvent) => {
-    if (!isDragging) return;
-
-    const deltaX = event.clientX - lastMousePos.x;
-    const deltaY = event.clientY - lastMousePos.y;
-    
-    setViewState(prev => {
-      const currentZoom = Math.min(dimensions.width, dimensions.height) / 3.5 * prev.zoom;
-      return {
+    if (isSelecting && selectionRect) {
+      // Update selection rectangle
+      setSelectionRect(prev => prev ? {
         ...prev,
-        centerX: prev.centerX - deltaX / currentZoom,
-        centerY: prev.centerY - deltaY / currentZoom
-      };
-    });
-    
-    setLastMousePos({ x: event.clientX, y: event.clientY });
-  }, [isDragging, lastMousePos, dimensions]);
+        endX: event.clientX,
+        endY: event.clientY,
+      } : null);
+    } else if (isDragging) {
+      // Normal panning
+      const deltaX = event.clientX - lastMousePos.x;
+      const deltaY = event.clientY - lastMousePos.y;
+      
+      setViewState(prev => {
+        const currentZoom = Math.min(dimensions.width, dimensions.height) / 3.5 * prev.zoom;
+        return {
+          ...prev,
+          centerX: prev.centerX - deltaX / currentZoom,
+          centerY: prev.centerY - deltaY / currentZoom
+        };
+      });
+      
+      setLastMousePos({ x: event.clientX, y: event.clientY });
+    }
+  }, [isDragging, isSelecting, lastMousePos, dimensions, selectionRect]);
 
   const handleMouseUp = useCallback(() => {
-    setIsDragging(false);
-  }, []);
+    if (isSelecting && selectionRect) {
+      // Save the selection as a bookmark
+      const rectWidth = Math.abs(selectionRect.endX - selectionRect.startX);
+      const rectHeight = Math.abs(selectionRect.endY - selectionRect.startY);
+      
+      // Only save if the selection is large enough
+      if (rectWidth > 20 && rectHeight > 20) {
+        saveBookmark(selectionRect);
+      }
+      
+      setIsSelecting(false);
+      setSelectionRect(null);
+    } else {
+      setIsDragging(false);
+    }
+  }, [isSelecting, selectionRect, saveBookmark]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -482,7 +632,7 @@ export default function FractalExplorer({}: FractalExplorerProps) {
           top: 0,
           left: 0,
           zIndex: 0,
-          cursor: isDragging ? 'grabbing' : 'grab'
+          cursor: isDragging ? 'grabbing' : isSelecting ? 'crosshair' : 'grab'
         }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
@@ -490,6 +640,64 @@ export default function FractalExplorer({}: FractalExplorerProps) {
         onMouseLeave={handleMouseUp}
       />
       
+      {/* Selection Rectangle */}
+      {isSelecting && selectionRect && (
+        <div
+          className="fixed border-2 border-yellow-400 bg-yellow-400 bg-opacity-20 pointer-events-none z-5"
+          style={{
+            left: Math.min(selectionRect.startX, selectionRect.endX),
+            top: Math.min(selectionRect.startY, selectionRect.endY),
+            width: Math.abs(selectionRect.endX - selectionRect.startX),
+            height: Math.abs(selectionRect.endY - selectionRect.startY),
+          }}
+        />
+      )}
+
+      {/* Bookmarks Panel */}
+      {bookmarks.length > 0 && (
+        <div className="fixed top-6 right-6 z-10 bg-black bg-opacity-80 text-white p-4 rounded-lg max-w-xs">
+          <div className="text-sm font-bold mb-3">📍 Bookmarks</div>
+          <div className="space-y-2 max-h-96 overflow-y-auto">
+            {bookmarks.map((bookmark) => (
+              <div key={bookmark.id} className="flex items-center justify-between bg-gray-800 p-2 rounded text-xs">
+                <div className="flex-1 min-w-0">
+                  <div className="font-mono truncate">{bookmark.name}</div>
+                  <div className="text-gray-400 text-xs">
+                    {bookmark.zoom.toFixed(1)}x zoom
+                  </div>
+                </div>
+                <div className="flex gap-1 ml-2">
+                  <button
+                    onClick={() => animateToBookmark(bookmark)}
+                    className="bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded text-xs"
+                    disabled={isAnimating}
+                  >
+                    Go
+                  </button>
+                  <button
+                    onClick={() => deleteBookmark(bookmark.id)}
+                    className="bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-xs"
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="text-xs text-gray-400 mt-3 border-t border-gray-600 pt-2">
+            Hold Shift + drag to create new bookmark
+          </div>
+        </div>
+      )}
+      
+      {/* Instructions overlay when no bookmarks */}
+      {bookmarks.length === 0 && (
+        <div className="fixed top-6 right-6 z-10 bg-black bg-opacity-70 text-white p-3 rounded-lg text-sm">
+          <div className="text-yellow-400 mb-1">📍 Create Bookmarks</div>
+          <div className="text-xs">Hold Shift + drag to select areas</div>
+        </div>
+      )}
+
       {/* Render Info Overlay */}
       <div className="fixed bottom-6 right-6 z-10 bg-black bg-opacity-70 text-white p-3 rounded-lg font-mono text-sm">
         <div className="text-xs opacity-75 mb-1">Render Info</div>
