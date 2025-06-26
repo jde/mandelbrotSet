@@ -471,22 +471,35 @@ export default function FractalExplorer({}: FractalExplorerProps) {
   };
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="block"
-      style={{
-        width: '100vw',
-        height: '100vh',
-        position: 'fixed',
-        top: 0,
-        left: 0,
-        zIndex: 0,
-        cursor: isDragging ? 'grabbing' : 'grab'
-      }}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        className="block"
+        style={{
+          width: '100vw',
+          height: '100vh',
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          zIndex: 0,
+          cursor: isDragging ? 'grabbing' : 'grab'
+        }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+      />
+      
+      {/* Render Info Overlay */}
+      <div className="fixed bottom-6 right-6 z-10 bg-black bg-opacity-70 text-white p-3 rounded-lg font-mono text-sm">
+        <div className="text-xs opacity-75 mb-1">Render Info</div>
+        <div>X: {viewState.centerX.toFixed(6)}</div>
+        <div>Y: {viewState.centerY.toFixed(6)}</div>
+        <div>Zoom: {viewState.zoom.toFixed(2)}x</div>
+        <div className="text-xs opacity-75 mt-1">
+          {supportsWebGPU ? '🚀 WebGPU' : '🐌 CPU'}
+        </div>
+      </div>
+    </>
   );
 }
