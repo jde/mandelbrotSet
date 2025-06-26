@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
+import * as THREE from 'three';
 
 interface FractalExplorerProps {}
 
@@ -37,6 +38,11 @@ interface SelectionRect {
 
 export default function FractalExplorer({}: FractalExplorerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const mountRef = useRef<HTMLDivElement>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const meshRef = useRef<THREE.Mesh | null>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
   const [viewState, setViewState] = useState<ViewState>({
     zoom: 1,
@@ -51,6 +57,18 @@ export default function FractalExplorer({}: FractalExplorerProps) {
   const [selectionRect, setSelectionRect] = useState<SelectionRect | null>(null);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [isAnimating, setIsAnimating] = useState(false);
+  const [is3D, setIs3D] = useState(true);
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  const [isRotating, setIsRotating] = useState(false);
+  const [resolution, setResolution] = useState(128);
+  const [lightSettings, setLightSettings] = useState({
+    intensity: 0.8,
+    x: 10,
+    y: 10,
+    z: 5,
+    color: '#ffffff'
+  });
+  const lightRef = useRef<THREE.DirectionalLight | null>(null);
 
   const initWebGPU = useCallback(async (): Promise<WebGPURenderer | null> => {
     if (!navigator.gpu) {
@@ -288,11 +306,177 @@ export default function FractalExplorer({}: FractalExplorerProps) {
     localStorage.setItem('fractal-bookmarks', JSON.stringify(bookmarks));
   }, [bookmarks]);
 
-  useEffect(() => {
-    if (dimensions.width > 0 && dimensions.height > 0 && supportsWebGPU === null) {
-      initWebGPU().then(setWebgpuRenderer);
+  const init3DScene = useCallback(() => {
+    if (!mountRef.current) return;
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    sceneRef.current = scene;
+
+    // Camera
+    const camera = new THREE.PerspectiveCamera(75, dimensions.width / dimensions.height, 0.1, 1000);
+    camera.position.set(0, 5, 10);
+    camera.lookAt(0, 0, 0);
+    cameraRef.current = camera;
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(dimensions.width, dimensions.height);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    rendererRef.current = renderer;
+
+    // Clear any existing canvas
+    mountRef.current.innerHTML = '';
+    mountRef.current.appendChild(renderer.domElement);
+
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0x404040, 0.4);
+    scene.add(ambientLight);
+
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(10, 10, 5);
+    directionalLight.castShadow = true;
+    directionalLight.shadow.mapSize.width = 2048;
+    directionalLight.shadow.mapSize.height = 2048;
+    directionalLight.shadow.camera.near = 0.1;
+    directionalLight.shadow.camera.far = 100;
+    directionalLight.shadow.camera.left = -10;
+    directionalLight.shadow.camera.right = 10;
+    directionalLight.shadow.camera.top = 10;
+    directionalLight.shadow.camera.bottom = -10;
+    scene.add(directionalLight);
+    lightRef.current = directionalLight;
+
+    // Controls
+    const animate = () => {
+      requestAnimationFrame(animate);
+      if (rendererRef.current && sceneRef.current && cameraRef.current) {
+        rendererRef.current.render(sceneRef.current, cameraRef.current);
+      }
+    };
+    animate();
+  }, [dimensions]);
+
+  const generateMandelbrotHeightMap = useCallback((meshResolution: number) => {
+    const heightData = new Float32Array(meshResolution * meshResolution);
+    const colorData = new Uint8Array(meshResolution * meshResolution * 3);
+    
+    const zoomScale = Math.min(dimensions.width, dimensions.height) / 3.5 * viewState.zoom;
+    
+    for (let y = 0; y < meshResolution; y++) {
+      for (let x = 0; x < meshResolution; x++) {
+        const index = y * meshResolution + x;
+        
+        // Map pixel to fractal coordinates
+        const fx = ((x / meshResolution) - 0.5) * 4 / viewState.zoom + viewState.centerX;
+        const fy = ((y / meshResolution) - 0.5) * 4 / viewState.zoom + viewState.centerY;
+        
+        // Calculate Mandelbrot
+        const iter = mandelbrot(fx, fy, 100);
+        
+        // Height based on iteration count
+        const normalizedIter = iter / 100;
+        heightData[index] = iter === 100 ? 0 : normalizedIter * 2; // Scale height
+        
+        // Color based on iteration count
+        const colorIndex = index * 3;
+        if (iter === 100) {
+          colorData[colorIndex] = 0;     // R
+          colorData[colorIndex + 1] = 0; // G
+          colorData[colorIndex + 2] = 0; // B
+        } else {
+          const hue = (iter * 8) % 360;
+          const [r, g, b] = hslToRgb(hue / 360, 1, 0.5);
+          colorData[colorIndex] = r;
+          colorData[colorIndex + 1] = g;
+          colorData[colorIndex + 2] = b;
+        }
+      }
     }
-  }, [dimensions, supportsWebGPU, initWebGPU]);
+    
+    return { heightData, colorData, resolution: meshResolution };
+  }, [viewState, dimensions]);
+
+  const create3DMesh = useCallback(() => {
+    if (!sceneRef.current) return;
+
+    // Remove existing mesh
+    if (meshRef.current) {
+      sceneRef.current.remove(meshRef.current);
+      if (meshRef.current.geometry) meshRef.current.geometry.dispose();
+      if (meshRef.current.material) {
+        if (Array.isArray(meshRef.current.material)) {
+          meshRef.current.material.forEach(mat => mat.dispose());
+        } else {
+          meshRef.current.material.dispose();
+        }
+      }
+    }
+
+    const { heightData, colorData, resolution: meshRes } = generateMandelbrotHeightMap(resolution);
+
+    // Create geometry
+    const geometry = new THREE.PlaneGeometry(8, 8, meshRes - 1, meshRes - 1);
+    const vertices = geometry.attributes.position.array as Float32Array;
+    const colors = new Float32Array(vertices.length);
+
+    // Apply height and color data
+    for (let i = 0; i < vertices.length / 3; i++) {
+      const heightIndex = i;
+      vertices[i * 3 + 2] = heightData[heightIndex]; // Z coordinate for height
+      
+      const colorIndex = heightIndex * 3;
+      colors[i * 3] = colorData[colorIndex] / 255;     // R
+      colors[i * 3 + 1] = colorData[colorIndex + 1] / 255; // G
+      colors[i * 3 + 2] = colorData[colorIndex + 2] / 255; // B
+    }
+
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.computeVertexNormals();
+
+    // Create material
+    const material = new THREE.MeshLambertMaterial({
+      vertexColors: true,
+      wireframe: false,
+      side: THREE.DoubleSide,
+    });
+
+    // Create mesh
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.rotation.x = -Math.PI / 2; // Rotate to make it horizontal
+    mesh.receiveShadow = true;
+    mesh.castShadow = true;
+    
+    sceneRef.current.add(mesh);
+    meshRef.current = mesh;
+  }, [generateMandelbrotHeightMap]);
+
+  useEffect(() => {
+    if (dimensions.width > 0 && dimensions.height > 0) {
+      if (is3D) {
+        init3DScene();
+      } else if (supportsWebGPU === null) {
+        initWebGPU().then(setWebgpuRenderer);
+      }
+    }
+  }, [dimensions, is3D, supportsWebGPU, initWebGPU, init3DScene]);
+
+  // Update light properties
+  useEffect(() => {
+    if (lightRef.current) {
+      lightRef.current.intensity = lightSettings.intensity;
+      lightRef.current.position.set(lightSettings.x, lightSettings.y, lightSettings.z);
+      lightRef.current.color.setStyle(lightSettings.color);
+    }
+  }, [lightSettings]);
+
+  useEffect(() => {
+    if (is3D && sceneRef.current) {
+      create3DMesh();
+    }
+  }, [is3D, viewState, resolution, create3DMesh]);
 
   const renderFractalWebGPU = useCallback(() => {
     if (!webgpuRenderer || !canvasRef.current || dimensions.width === 0 || dimensions.height === 0) return;
@@ -342,6 +526,7 @@ export default function FractalExplorer({}: FractalExplorerProps) {
   }, [webgpuRenderer, dimensions, viewState]);
 
   const renderFractal = useCallback(() => {
+    if (is3D) return; // 3D rendering is handled by Three.js
     if (!canvasRef.current || dimensions.width === 0 || dimensions.height === 0) return;
 
     if (webgpuRenderer && supportsWebGPU) {
@@ -356,7 +541,7 @@ export default function FractalExplorer({}: FractalExplorerProps) {
 
       renderMandelbrot(ctx, dimensions.width, dimensions.height, viewState);
     }
-  }, [dimensions, viewState, webgpuRenderer, supportsWebGPU, renderFractalWebGPU]);
+  }, [dimensions, viewState, webgpuRenderer, supportsWebGPU, renderFractalWebGPU, is3D]);
 
   useEffect(() => {
     renderFractal();
@@ -487,8 +672,8 @@ export default function FractalExplorer({}: FractalExplorerProps) {
   }, []);
 
   const handleMouseDown = useCallback((event: React.MouseEvent) => {
-    if (event.shiftKey) {
-      // Start rectangle selection when Shift is held
+    if (event.shiftKey && !is3D) {
+      // Start rectangle selection when Shift is held (only in 2D mode)
       setIsSelecting(true);
       setSelectionRect({
         startX: event.clientX,
@@ -496,23 +681,46 @@ export default function FractalExplorer({}: FractalExplorerProps) {
         endX: event.clientX,
         endY: event.clientY,
       });
-    } else {
-      // Normal dragging
+    } else if (is3D && event.button === 0) {
+      // 3D camera rotation
+      setIsRotating(true);
+      setMousePos({ x: event.clientX, y: event.clientY });
+    } else if (!is3D) {
+      // Normal 2D dragging
       setIsDragging(true);
       setLastMousePos({ x: event.clientX, y: event.clientY });
     }
-  }, []);
+  }, [is3D]);
 
   const handleMouseMove = useCallback((event: React.MouseEvent) => {
-    if (isSelecting && selectionRect) {
-      // Update selection rectangle
+    if (isSelecting && selectionRect && !is3D) {
+      // Update selection rectangle (2D mode only)
       setSelectionRect(prev => prev ? {
         ...prev,
         endX: event.clientX,
         endY: event.clientY,
       } : null);
-    } else if (isDragging) {
-      // Normal panning
+    } else if (isRotating && is3D && cameraRef.current) {
+      // 3D camera rotation
+      const deltaX = event.clientX - mousePos.x;
+      const deltaY = event.clientY - mousePos.y;
+      
+      const rotationSpeed = 0.005;
+      const camera = cameraRef.current;
+      
+      // Rotate around Y axis (horizontal mouse movement)
+      const spherical = new THREE.Spherical();
+      spherical.setFromVector3(camera.position);
+      spherical.theta -= deltaX * rotationSpeed;
+      spherical.phi += deltaY * rotationSpeed;
+      spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
+      
+      camera.position.setFromSpherical(spherical);
+      camera.lookAt(0, 0, 0);
+      
+      setMousePos({ x: event.clientX, y: event.clientY });
+    } else if (isDragging && !is3D) {
+      // Normal 2D panning
       const deltaX = event.clientX - lastMousePos.x;
       const deltaY = event.clientY - lastMousePos.y;
       
@@ -527,11 +735,11 @@ export default function FractalExplorer({}: FractalExplorerProps) {
       
       setLastMousePos({ x: event.clientX, y: event.clientY });
     }
-  }, [isDragging, isSelecting, lastMousePos, dimensions, selectionRect]);
+  }, [isDragging, isSelecting, isRotating, lastMousePos, mousePos, dimensions, selectionRect, is3D]);
 
   const handleMouseUp = useCallback(() => {
-    if (isSelecting && selectionRect) {
-      // Save the selection as a bookmark
+    if (isSelecting && selectionRect && !is3D) {
+      // Save the selection as a bookmark (2D mode only)
       const rectWidth = Math.abs(selectionRect.endX - selectionRect.startX);
       const rectHeight = Math.abs(selectionRect.endY - selectionRect.startY);
       
@@ -544,16 +752,44 @@ export default function FractalExplorer({}: FractalExplorerProps) {
       setSelectionRect(null);
     } else {
       setIsDragging(false);
+      setIsRotating(false);
     }
-  }, [isSelecting, selectionRect, saveBookmark]);
+  }, [isSelecting, selectionRect, saveBookmark, is3D]);
+
+  const handleWheel3D = useCallback((event: WheelEvent) => {
+    if (!is3D || !cameraRef.current) return;
+    
+    event.preventDefault();
+    const camera = cameraRef.current;
+    const zoomSpeed = 0.1;
+    
+    // Zoom in/out by moving camera closer/further
+    const direction = new THREE.Vector3();
+    camera.getWorldDirection(direction);
+    
+    if (event.deltaY > 0) {
+      camera.position.add(direction.multiplyScalar(zoomSpeed));
+    } else {
+      camera.position.sub(direction.multiplyScalar(zoomSpeed));
+    }
+    
+    // Prevent camera from going too close or too far
+    const distance = camera.position.length();
+    if (distance < 2) {
+      camera.position.normalize().multiplyScalar(2);
+    } else if (distance > 50) {
+      camera.position.normalize().multiplyScalar(50);
+    }
+  }, [is3D]);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const element = is3D ? mountRef.current : canvasRef.current;
+    if (!element) return;
 
-    canvas.addEventListener('wheel', handleWheel);
-    return () => canvas.removeEventListener('wheel', handleWheel);
-  }, [handleWheel]);
+    const wheelHandler = is3D ? handleWheel3D : handleWheel;
+    element.addEventListener('wheel', wheelHandler);
+    return () => element.removeEventListener('wheel', wheelHandler);
+  }, [handleWheel, handleWheel3D, is3D]);
 
   const renderMandelbrot = (ctx: CanvasRenderingContext2D, width: number, height: number, view: ViewState) => {
     const imageData = ctx.createImageData(width, height);
@@ -622,9 +858,21 @@ export default function FractalExplorer({}: FractalExplorerProps) {
 
   return (
     <>
+      {/* 3D Mount Point */}
+      <div
+        ref={mountRef}
+        className={`fixed top-0 left-0 w-full h-full ${is3D ? 'block' : 'hidden'}`}
+        style={{ zIndex: 0 }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+      />
+
+      {/* 2D Canvas */}
       <canvas
         ref={canvasRef}
-        className="block"
+        className={`block ${is3D ? 'hidden' : 'block'}`}
         style={{
           width: '100vw',
           height: '100vh',
@@ -640,8 +888,146 @@ export default function FractalExplorer({}: FractalExplorerProps) {
         onMouseLeave={handleMouseUp}
       />
       
-      {/* Selection Rectangle */}
-      {isSelecting && selectionRect && (
+      {/* 3D/2D Toggle and Controls */}
+      <div className="fixed top-6 left-6 z-10 bg-black bg-opacity-80 text-white p-3 rounded-lg">
+        <div className="text-sm font-bold mb-2">View Mode</div>
+        <div className="flex gap-2 mb-3">
+          <button
+            onClick={() => setIs3D(false)}
+            className={`px-3 py-1 rounded text-xs ${!is3D ? 'bg-blue-600' : 'bg-gray-600 hover:bg-gray-500'}`}
+          >
+            2D
+          </button>
+          <button
+            onClick={() => setIs3D(true)}
+            className={`px-3 py-1 rounded text-xs ${is3D ? 'bg-blue-600' : 'bg-gray-600 hover:bg-gray-500'}`}
+          >
+            3D
+          </button>
+        </div>
+        
+        {is3D && (
+          <>
+            {/* Resolution Slider */}
+            <div className="mb-3 border-t border-gray-600 pt-3">
+              <div className="text-xs font-bold mb-2">Resolution: {resolution}x{resolution}</div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs">Low</span>
+                <input
+                  type="range"
+                  min="32"
+                  max="512"
+                  step="32"
+                  value={resolution}
+                  onChange={(e) => setResolution(parseInt(e.target.value))}
+                  className="flex-1 h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer slider"
+                  style={{
+                    background: `linear-gradient(to right, #3b82f6 0%, #3b82f6 ${((resolution - 32) / (512 - 32)) * 100}%, #4b5563 ${((resolution - 32) / (512 - 32)) * 100}%, #4b5563 100%)`
+                  }}
+                />
+                <span className="text-xs">High</span>
+              </div>
+              <div className="text-xs text-gray-400 mt-1">
+                {resolution <= 64 && "⚡ Fast"}
+                {resolution > 64 && resolution <= 256 && "⚖️ Balanced"}
+                {resolution > 256 && "🎯 Detailed"}
+              </div>
+            </div>
+            
+            {/* Lighting Controls */}
+            <div className="mb-3 border-t border-gray-600 pt-3">
+              <div className="text-xs font-bold mb-2">🔆 Lighting</div>
+              
+              {/* Light Intensity */}
+              <div className="mb-2">
+                <div className="text-xs mb-1">Intensity: {lightSettings.intensity.toFixed(1)}</div>
+                <input
+                  type="range"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={lightSettings.intensity}
+                  onChange={(e) => setLightSettings(prev => ({ ...prev, intensity: parseFloat(e.target.value) }))}
+                  className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              {/* Light Position X */}
+              <div className="mb-2">
+                <div className="text-xs mb-1">X Position: {lightSettings.x.toFixed(0)}</div>
+                <input
+                  type="range"
+                  min="-20"
+                  max="20"
+                  step="1"
+                  value={lightSettings.x}
+                  onChange={(e) => setLightSettings(prev => ({ ...prev, x: parseFloat(e.target.value) }))}
+                  className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              {/* Light Position Y */}
+              <div className="mb-2">
+                <div className="text-xs mb-1">Y Position: {lightSettings.y.toFixed(0)}</div>
+                <input
+                  type="range"
+                  min="2"
+                  max="30"
+                  step="1"
+                  value={lightSettings.y}
+                  onChange={(e) => setLightSettings(prev => ({ ...prev, y: parseFloat(e.target.value) }))}
+                  className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              {/* Light Position Z */}
+              <div className="mb-2">
+                <div className="text-xs mb-1">Z Position: {lightSettings.z.toFixed(0)}</div>
+                <input
+                  type="range"
+                  min="-20"
+                  max="20"
+                  step="1"
+                  value={lightSettings.z}
+                  onChange={(e) => setLightSettings(prev => ({ ...prev, z: parseFloat(e.target.value) }))}
+                  className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              {/* Light Color */}
+              <div className="mb-2">
+                <div className="text-xs mb-1">Color</div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="color"
+                    value={lightSettings.color}
+                    onChange={(e) => setLightSettings(prev => ({ ...prev, color: e.target.value }))}
+                    className="w-8 h-6 rounded border-none cursor-pointer"
+                  />
+                  <span className="text-xs text-gray-300">{lightSettings.color}</span>
+                </div>
+              </div>
+
+              {/* Reset Button */}
+              <button
+                onClick={() => setLightSettings({ intensity: 0.8, x: 10, y: 10, z: 5, color: '#ffffff' })}
+                className="w-full bg-gray-600 hover:bg-gray-500 px-2 py-1 rounded text-xs"
+              >
+                Reset Light
+              </button>
+            </div>
+
+            {/* Controls */}
+            <div className="text-xs text-gray-400 border-t border-gray-600 pt-2">
+              <div>🖱️ Drag to rotate</div>
+              <div>🔍 Scroll to zoom</div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Selection Rectangle (2D only) */}
+      {isSelecting && selectionRect && !is3D && (
         <div
           className="fixed border-2 border-yellow-400 bg-yellow-400 bg-opacity-20 pointer-events-none z-5"
           style={{
@@ -653,8 +1039,8 @@ export default function FractalExplorer({}: FractalExplorerProps) {
         />
       )}
 
-      {/* Bookmarks Panel */}
-      {bookmarks.length > 0 && (
+      {/* Bookmarks Panel (2D only) */}
+      {bookmarks.length > 0 && !is3D && (
         <div className="fixed top-6 right-6 z-10 bg-black bg-opacity-80 text-white p-4 rounded-lg max-w-xs">
           <div className="text-sm font-bold mb-3">📍 Bookmarks</div>
           <div className="space-y-2 max-h-96 overflow-y-auto">
@@ -690,8 +1076,8 @@ export default function FractalExplorer({}: FractalExplorerProps) {
         </div>
       )}
       
-      {/* Instructions overlay when no bookmarks */}
-      {bookmarks.length === 0 && (
+      {/* Instructions overlay when no bookmarks (2D only) */}
+      {bookmarks.length === 0 && !is3D && (
         <div className="fixed top-6 right-6 z-10 bg-black bg-opacity-70 text-white p-3 rounded-lg text-sm">
           <div className="text-yellow-400 mb-1">📍 Create Bookmarks</div>
           <div className="text-xs">Hold Shift + drag to select areas</div>
@@ -701,11 +1087,13 @@ export default function FractalExplorer({}: FractalExplorerProps) {
       {/* Render Info Overlay */}
       <div className="fixed bottom-6 right-6 z-10 bg-black bg-opacity-70 text-white p-3 rounded-lg font-mono text-sm">
         <div className="text-xs opacity-75 mb-1">Render Info</div>
+        <div>Mode: {is3D ? '3D Height Map' : '2D Fractal'}</div>
         <div>X: {viewState.centerX.toFixed(6)}</div>
         <div>Y: {viewState.centerY.toFixed(6)}</div>
         <div>Zoom: {viewState.zoom.toFixed(2)}x</div>
+        {is3D && <div>Mesh: {resolution}x{resolution}</div>}
         <div className="text-xs opacity-75 mt-1">
-          {supportsWebGPU ? '🚀 WebGPU' : '🐌 CPU'}
+          {is3D ? '🎮 Three.js' : (supportsWebGPU ? '🚀 WebGPU' : '🐌 CPU')}
         </div>
       </div>
     </>
